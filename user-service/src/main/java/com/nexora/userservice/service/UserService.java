@@ -1,6 +1,7 @@
 package com.nexora.userservice.service;
 
 import com.nexora.userservice.entity.User;
+import com.nexora.userservice.exception.UserNotFoundException;
 import com.nexora.userservice.repository.UserRepository;
 import org.springframework.stereotype.Service;
 
@@ -21,6 +22,10 @@ public class UserService {
 
     public List<User> getAllUsers(){
         return userRepository.findAll();
+    }
+
+    public User getUserById(Long id){
+        return userRepository.findById(id).orElseThrow(()-> new UserNotFoundException("User with id " + id + " not found"));
     }
 
 }
