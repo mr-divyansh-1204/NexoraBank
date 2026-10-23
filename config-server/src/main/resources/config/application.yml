@@ -1,0 +1,3 @@
+jwt.secret: NexoraBankJwtSecretKeyThatIsAtLeast32CharsLong!
+jwt.expiration-ms: 86400000
+internal.api-key: nexora-internal-dev-key

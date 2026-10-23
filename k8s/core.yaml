@@ -1,0 +1,477 @@
+# Nexora Bank — sample Kubernetes manifests for all services + infrastructure.
+#
+# No service discovery inside the apps: the gateway and Feign clients call
+# plain DNS names (kube-dns here; ECS Service Connect / Cloud Map names on AWS).
+#
+# Prerequisites:
+#   1. Build and load the seven service images (one per service Dockerfile), e.g.:
+#        docker build -t nexora/user-service:latest ./user-service
+#        ... (repeat per service)
+#      then `minikube image load nexora/<name>:latest` (or push to a registry).
+#   2. kubectl apply -f k8s/core.yaml
+#
+# The API Gateway is exposed via NodePort 30080: http://<node-ip>:30080
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: nexora-bank
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: nexora-secrets
+  namespace: nexora-bank
+type: Opaque
+stringData:
+  mysql-password: Divyansh@42
+  jwt-secret: NexoraBankJwtSecretKeyThatIsAtLeast32CharsLong!
+  internal-api-key: nexora-internal-dev-key
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: nexora-config
+  namespace: nexora-bank
+data:
+  MYSQL_URL: jdbc:mysql://mysql:3306/nexora_bank
+  MYSQL_USER: root
+  KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+  # Explicit service URLs — infrastructure (kube-dns / ECS Service Connect / Cloud Map)
+  # owns discovery, load balancing and health-aware routing, not the apps.
+  USER_SERVICE_URL: http://user-service:8081
+  ACCOUNT_SERVICE_URL: http://account-service:8082
+  TRANSACTION_SERVICE_URL: http://transaction-service:8083
+  NOTIFICATION_SERVICE_URL: http://notification-service:8084
+---
+# ---------------- Infrastructure: MySQL ----------------
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: mysql-data
+  namespace: nexora-bank
+spec:
+  accessModes: ["ReadWriteOnce"]
+  resources:
+    requests:
+      storage: 5Gi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mysql
+  namespace: nexora-bank
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: mysql
+  template:
+    metadata:
+      labels:
+        app: mysql
+    spec:
+      containers:
+        - name: mysql
+          image: mysql:8.0
+          ports:
+            - containerPort: 3306
+          env:
+            - name: MYSQL_ROOT_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: nexora-secrets
+                  key: mysql-password
+            - name: MYSQL_DATABASE
+              value: nexora_bank
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/mysql
+          readinessProbe:
+            exec:
+              command: ["sh", "-c", "mysqladmin ping -h localhost"]
+            initialDelaySeconds: 20
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 12
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: mysql
+  namespace: nexora-bank
+spec:
+  selector:
+    app: mysql
+  ports:
+    - port: 3306
+      targetPort: 3306
+---
+# ---------------- Infrastructure: Kafka (KRaft, no ZooKeeper) ----------------
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: kafka
+  namespace: nexora-bank
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: kafka
+  template:
+    metadata:
+      labels:
+        app: kafka
+    spec:
+      containers:
+        - name: kafka
+          image: bitnami/kafka:3.8
+          ports:
+            - containerPort: 9092
+          env:
+            - name: KAFKA_CFG_NODE_ID
+              value: "0"
+            - name: KAFKA_CFG_PROCESS_ROLES
+              value: controller,broker
+            - name: KAFKA_CFG_LISTENERS
+              value: PLAINTEXT://:9092,CONTROLLER://:9093
+            - name: KAFKA_CFG_ADVERTISED_LISTENERS
+              value: PLAINTEXT://kafka:9092
+            - name: KAFKA_CFG_LISTENER_SECURITY_PROTOCOL_MAP
+              value: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT
+            - name: KAFKA_CFG_CONTROLLER_QUORUM_VOTERS
+              value: 0@kafka:9093
+            - name: KAFKA_CFG_CONTROLLER_LISTENER_NAMES
+              value: CONTROLLER
+            - name: ALLOW_PLAINTEXT_LISTENER
+              value: "yes"
+          readinessProbe:
+            tcpSocket:
+              port: 9092
+            initialDelaySeconds: 20
+            periodSeconds: 10
+            failureThreshold: 12
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: kafka
+  namespace: nexora-bank
+spec:
+  selector:
+    app: kafka
+  ports:
+    - port: 9092
+      targetPort: 9092
+---
+# ---------------- config-server :8888 (optional) ----------------
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: config-server
+  namespace: nexora-bank
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: config-server
+  template:
+    metadata:
+      labels:
+        app: config-server
+    spec:
+      containers:
+        - name: config-server
+          image: nexora/config-server:latest
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 8888
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: config-server
+  namespace: nexora-bank
+spec:
+  selector:
+    app: config-server
+  ports:
+    - port: 8888
+      targetPort: 8888
+---
+# ---------------- api-gateway :8080 (NodePort 30080) ----------------
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: api-gateway
+  namespace: nexora-bank
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: api-gateway
+  template:
+    metadata:
+      labels:
+        app: api-gateway
+    spec:
+      containers:
+        - name: api-gateway
+          image: nexora/api-gateway:latest
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 8080
+          envFrom:
+            - configMapRef:
+                name: nexora-config
+          env:
+            - name: JWT_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: nexora-secrets
+                  key: jwt-secret
+          readinessProbe:
+            httpGet:
+              path: /actuator/health
+              port: 8080
+            initialDelaySeconds: 20
+            periodSeconds: 10
+            failureThreshold: 12
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: api-gateway
+  namespace: nexora-bank
+spec:
+  type: NodePort
+  selector:
+    app: api-gateway
+  ports:
+    - port: 8080
+      targetPort: 8080
+      nodePort: 30080
+---
+# ---------------- user-service :8081 ----------------
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: user-service
+  namespace: nexora-bank
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: user-service
+  template:
+    metadata:
+      labels:
+        app: user-service
+    spec:
+      containers:
+        - name: user-service
+          image: nexora/user-service:latest
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 8081
+          envFrom:
+            - configMapRef:
+                name: nexora-config
+          env:
+            - name: MYSQL_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: nexora-secrets
+                  key: mysql-password
+            - name: JWT_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: nexora-secrets
+                  key: jwt-secret
+            - name: INTERNAL_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: nexora-secrets
+                  key: internal-api-key
+          readinessProbe:
+            httpGet:
+              path: /actuator/health
+              port: 8081
+            initialDelaySeconds: 25
+            periodSeconds: 10
+            failureThreshold: 12
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: user-service
+  namespace: nexora-bank
+spec:
+  selector:
+    app: user-service
+  ports:
+    - port: 8081
+      targetPort: 8081
+---
+# ---------------- account-service :8082 ----------------
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: account-service
+  namespace: nexora-bank
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: account-service
+  template:
+    metadata:
+      labels:
+        app: account-service
+    spec:
+      containers:
+        - name: account-service
+          image: nexora/account-service:latest
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 8082
+          envFrom:
+            - configMapRef:
+                name: nexora-config
+          env:
+            - name: MYSQL_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: nexora-secrets
+                  key: mysql-password
+            - name: INTERNAL_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: nexora-secrets
+                  key: internal-api-key
+          readinessProbe:
+            httpGet:
+              path: /actuator/health
+              port: 8082
+            initialDelaySeconds: 25
+            periodSeconds: 10
+            failureThreshold: 12
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: account-service
+  namespace: nexora-bank
+spec:
+  selector:
+    app: account-service
+  ports:
+    - port: 8082
+      targetPort: 8082
+---
+# ---------------- transaction-service :8083 ----------------
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: transaction-service
+  namespace: nexora-bank
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: transaction-service
+  template:
+    metadata:
+      labels:
+        app: transaction-service
+    spec:
+      containers:
+        - name: transaction-service
+          image: nexora/transaction-service:latest
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 8083
+          envFrom:
+            - configMapRef:
+                name: nexora-config
+          env:
+            - name: MYSQL_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: nexora-secrets
+                  key: mysql-password
+            - name: INTERNAL_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: nexora-secrets
+                  key: internal-api-key
+          readinessProbe:
+            httpGet:
+              path: /actuator/health
+              port: 8083
+            initialDelaySeconds: 25
+            periodSeconds: 10
+            failureThreshold: 12
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: transaction-service
+  namespace: nexora-bank
+spec:
+  selector:
+    app: transaction-service
+  ports:
+    - port: 8083
+      targetPort: 8083
+---
+# ---------------- notification-service :8084 ----------------
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: notification-service
+  namespace: nexora-bank
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: notification-service
+  template:
+    metadata:
+      labels:
+        app: notification-service
+    spec:
+      containers:
+        - name: notification-service
+          image: nexora/notification-service:latest
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 8084
+          envFrom:
+            - configMapRef:
+                name: nexora-config
+          env:
+            - name: MYSQL_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: nexora-secrets
+                  key: mysql-password
+          readinessProbe:
+            httpGet:
+              path: /actuator/health
+              port: 8084
+            initialDelaySeconds: 25
+            periodSeconds: 10
+            failureThreshold: 12
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: notification-service
+  namespace: nexora-bank
+spec:
+  selector:
+    app: notification-service
+  ports:
+    - port: 8084
+      targetPort: 8084

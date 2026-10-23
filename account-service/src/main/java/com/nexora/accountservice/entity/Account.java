@@ -1,6 +1,9 @@
 package com.nexora.accountservice.entity;
 
+import jakarta.annotation.Nullable;
 import jakarta.persistence.*;
+
+import java.math.BigDecimal;
 
 @Entity
 @Table(name="accounts")
@@ -16,17 +19,25 @@ public class Account {
     @Column(nullable = false)
     private String accountHolderName;
 
+    @Column(nullable = false, precision = 19, scale = 2)
+    private BigDecimal balance;
+
     @Column(nullable = false)
-    private double balance;
+    private Long userId;
+
+    @Version
+    @Column(nullable = false)
+    private Long version;
 
     public Account(){
 
     }
-    public Account(Long id, String accountNumber, String accountHolderName, Double balance){
+    public Account(Long id, String accountNumber, String accountHolderName, BigDecimal balance, Long userId){
         this.id=id;
         this.accountNumber=accountNumber;
         this.accountHolderName=accountHolderName;
         this.balance=balance;
+        this.userId=userId;
     }
 
     public Long getId(){
@@ -51,11 +62,25 @@ public class Account {
     public void setAccountHolderName(String accountHolderName){
         this.accountHolderName=accountHolderName;
     }
-    public double getBalance(){
+    public BigDecimal getBalance(){
         return balance;
     }
-    public void setBalance(double balance){
+    public void setBalance(BigDecimal balance){
         this.balance=balance;
     }
+    public Long getUserId() {
+        return userId;
+    }
 
+    public void setUserId(Long userId) {
+        this.userId = userId;
+    }
+
+    public Long getVersion() {
+        return version;
+    }
+
+    public void setVersion(Long version) {
+        this.version = version;
+    }
 }
